@@ -4,3 +4,4 @@ plotly
 reportlab
 openpyxl
 kaleido==0.2.1
+matplotlib
