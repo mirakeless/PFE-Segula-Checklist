@@ -23,6 +23,10 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 # ==============================================================================
 # CONFIGURATION GÉNÉRALE
 # ==============================================================================
@@ -940,16 +944,24 @@ def render_workspace_page():
             else:
                 st.error("Veuillez renseigner ID, chapitre et critère.")
         st.markdown("---")
-        options_liste = checklist_df["id_point"].astype(str) + " - " + checklist_df["desc"]
-        critere_selectionne = st.selectbox("Critère à supprimer", options_liste)
-        if st.button("Supprimer le critère sélectionné"):
-            id_a_effacer = critere_selectionne.split(" - ")[0]
-            conn = get_conn()
-            conn.execute("DELETE FROM master_checklist WHERE id_point=?", (id_a_effacer,))
-            conn.commit()
-            conn.close()
-            st.success("Critère supprimé.")
-            st.rerun()
+        # Compatibilité Streamlit Cloud / Pandas Arrow : éviter l’addition directe de Series texte
+        # qui peut provoquer un TypeError avec certains types string[pyarrow].
+        options_liste = [
+            f"{str(row['id_point'])} - {str(row['desc'])}"
+            for _, row in checklist_df.iterrows()
+        ]
+        if options_liste:
+            critere_selectionne = st.selectbox("Critère à supprimer", options_liste)
+            if st.button("Supprimer le critère sélectionné"):
+                id_a_effacer = critere_selectionne.split(" - ")[0]
+                conn = get_conn()
+                conn.execute("DELETE FROM master_checklist WHERE id_point=?", (id_a_effacer,))
+                conn.commit()
+                conn.close()
+                st.success("Critère supprimé.")
+                st.rerun()
+        else:
+            st.info("Aucun critère disponible à supprimer.")
 
 
     def build_checklist_export_dataframe():
@@ -1011,12 +1023,14 @@ def render_workspace_page():
         buf.seek(0)
         return buf
 
-    st.markdown('<div class="download-zone"><b>Exports du cahier</b><br><span style="color:#64748B;font-size:13px;">Téléchargement de la checklist du cahier sélectionné avec en-tête, jugements, notes et traçabilité.</span></div>', unsafe_allow_html=True)
-    d1, d2 = st.columns(2)
-    with d1:
-        st.download_button("Télécharger la checklist Excel", data=export_checklist_excel(), file_name=f"Checklist_{(vwi_input or header_data.get('ref_cahier','Nouveau')).replace('/', '_')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-    with d2:
-        st.download_button("Télécharger la checklist PDF", data=export_checklist_pdf(), file_name=f"Checklist_{(vwi_input or header_data.get('ref_cahier','Nouveau')).replace('/', '_')}.pdf", mime="application/pdf", use_container_width=True)
+    st.markdown('<div class="download-zone"><b>Export du cahier</b><br><span style="color:#64748B;font-size:13px;">Téléchargement de la checklist complète du cahier sélectionné avec en-tête, jugements, notes et traçabilité.</span></div>', unsafe_allow_html=True)
+    st.download_button(
+        "Télécharger la checklist PDF",
+        data=export_checklist_pdf(),
+        file_name=f"Checklist_{(vwi_input or header_data.get('ref_cahier','Nouveau')).replace('/', '_')}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
 
     if allowed_to_edit:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -1169,11 +1183,84 @@ def render_dashboard_page():
         st.dataframe(df_trace[["created_at", "action", "user_name", "user_role", "details"]], use_container_width=True, hide_index=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    def figure_to_png(fig, width=900, height=500):
-        try:
-            return fig.to_image(format="png", width=width, height=height, scale=2)
-        except Exception:
-            return None
+    def _mpl_to_png(fig):
+        buf_img = io.BytesIO()
+        fig.savefig(buf_img, format="png", dpi=180, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        buf_img.seek(0)
+        return buf_img.read()
+
+    def dashboard_chart_png(title):
+        navy = "#0B2D4D"
+        red = "#DC2626"
+        blue = "#2563EB"
+        gray = "#94A3B8"
+        green = "#16A34A"
+
+        if title == "Avancement par profil":
+            fig, ax = plt.subplots(figsize=(9.2, 4.5))
+            x = list(range(len(prof_df)))
+            width = 0.18
+            series = [("OK", green), ("NOK", red), ("NA", blue), ("Restant", gray)]
+            for idx, (col, color) in enumerate(series):
+                values = prof_df[col].astype(float).tolist()
+                bars = ax.bar([v + (idx - 1.5) * width for v in x], values, width=width, label=col, color=color)
+                for bar in bars:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2, height + 0.3, f"{int(height)}", ha="center", va="bottom", fontsize=8)
+            ax.set_xticks(x)
+            ax.set_xticklabels(prof_df["Profil"].tolist(), rotation=0, fontsize=9)
+            ax.set_ylabel("Nombre de points")
+            ax.set_title("Avancement par profil", fontweight="bold", color=navy)
+            ax.grid(axis="y", alpha=0.25)
+            ax.legend(ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.12))
+            return _mpl_to_png(fig)
+
+        if title == "Synthèse globale":
+            fig, ax = plt.subplots(figsize=(6.8, 4.5))
+            values = [total_ok, total_nok, total_na, total_remaining]
+            labels = ["OK", "NOK", "NA", "Restant"]
+            colors_m = [green, red, blue, gray]
+            if sum(values) == 0:
+                values = [1]
+                labels = ["Aucune donnée"]
+                colors_m = [gray]
+            ax.pie(values, labels=labels, autopct=lambda p: f"{p:.1f}%" if p > 0 else "", startangle=90, colors=colors_m, textprops={"fontsize": 9})
+            centre = plt.Circle((0, 0), 0.55, fc="white")
+            ax.add_artist(centre)
+            ax.set_title("Synthèse globale", fontweight="bold", color=navy)
+            return _mpl_to_png(fig)
+
+        if title == "Jauge de maturité":
+            fig, ax = plt.subplots(figsize=(7.8, 2.6))
+            ax.barh([0], [100], color="#E2E8F0", height=0.42)
+            ax.barh([0], [maturity], color=navy, height=0.42)
+            ax.text(min(maturity + 2, 96), 0, f"{maturity:.1f}%", va="center", ha="left", fontsize=16, fontweight="bold", color=navy)
+            ax.set_xlim(0, 100)
+            ax.set_yticks([])
+            ax.set_xlabel("Taux de maturité qualité")
+            ax.set_title("Jauge de maturité qualité", fontweight="bold", color=navy)
+            ax.grid(axis="x", alpha=0.20)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            return _mpl_to_png(fig)
+
+        if title == "Avancement OK par chapitre":
+            fig_height = max(4.8, 0.42 * max(1, len(chap_df)))
+            fig, ax = plt.subplots(figsize=(10, fig_height))
+            plot_df = chap_df.copy().sort_values("Taux OK")
+            bars = ax.barh(plot_df["Chapitre"], plot_df["Taux OK"], color=navy)
+            ax.set_xlim(0, 100)
+            ax.set_xlabel("Taux OK (%)")
+            ax.set_title("Avancement OK par chapitre", fontweight="bold", color=navy)
+            ax.grid(axis="x", alpha=0.20)
+            ax.tick_params(axis='y', labelsize=7)
+            for bar in bars:
+                width = bar.get_width()
+                ax.text(width + 1, bar.get_y() + bar.get_height()/2, f"{width:.1f}%", va="center", fontsize=7)
+            return _mpl_to_png(fig)
+
+        return None
 
     def export_dash_html():
         nok_html = pd.DataFrame(nok_rows).to_html(index=False, escape=True) if nok_rows else "<p>Aucun NOK enregistré.</p>"
@@ -1226,13 +1313,14 @@ def render_dashboard_page():
         table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0B2D4D")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), 1, colors.HexColor("#CBD5E1")), ("PADDING", (0,0), (-1,-1), 8), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold")]))
         story.append(table)
         story.append(Spacer(1, 14))
-        for title, fig in [("Avancement par profil", fig_bar), ("Synthèse globale", fig_pie), ("Jauge de maturité", fig_gauge), ("Avancement OK par chapitre", fig_chap)]:
+        for title in ["Avancement par profil", "Synthèse globale", "Jauge de maturité", "Avancement OK par chapitre"]:
             story.append(Paragraph(title, styles["Heading2"]))
-            img = figure_to_png(fig)
+            img = dashboard_chart_png(title)
             if img:
-                story.append(Image(io.BytesIO(img), width=7.4*inch, height=3.6*inch))
-            else:
-                story.append(Paragraph("Graphique non exporté : installez kaleido pour intégrer les graphes dans le PDF.", styles["Normal"]))
+                if title == "Avancement OK par chapitre":
+                    story.append(Image(io.BytesIO(img), width=9.1*inch, height=4.4*inch))
+                else:
+                    story.append(Image(io.BytesIO(img), width=7.6*inch, height=3.7*inch))
             story.append(Spacer(1, 10))
         story.append(PageBreak())
         story.append(Paragraph("Détail par profil", styles["Heading2"]))
@@ -1266,7 +1354,7 @@ def render_dashboard_page():
         buf.seek(0)
         return buf
 
-    st.markdown('<div class="download-zone"><b>Exports complets du dashboard</b><br><span style="color:#64748B;font-size:13px;">Le fichier HTML garde tous les graphes et les tableaux. Le PDF intègre les graphes si le package kaleido est installé.</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="download-zone"><b>Exports complets du dashboard</b><br><span style="color:#64748B;font-size:13px;">Téléchargement du rapport complet avec indicateurs, graphes, plan d’action NOK et historique de traçabilité.</span></div>', unsafe_allow_html=True)
     e1, e2 = st.columns(2)
     with e1:
         st.download_button("Télécharger toute la page dashboard HTML", data=export_dash_html(), file_name=f"Dashboard_Complet_{cahier_dashboard}.html", mime="text/html", use_container_width=True)
